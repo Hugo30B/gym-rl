@@ -56,7 +56,14 @@ void setup(){
 }
 
 void loop() {
-  vTaskDelay(pdMS_TO_TICKS(10));
+  static uint32_t next_show_time = 0;
+  vTaskDelay(pdMS_TO_TICKS(5));
+  
+  if(millis() > next_show_time) {
+    draw_waveform();
+    next_show_time = millis() + 10;
+  }
+
   M5.update();
 
   // Función de apagado por seguridad (BtnB pulsado 2 segundos)
@@ -81,6 +88,11 @@ static void PIDTask(void *arg) {
   uint32_t last_ticks = 0;
   const float dt = 0.005f; // Bucle a 200Hz
 
+  // Necesitamos los offsets para theta_dot
+  int16_t x_offset, y_offset, z_offset;
+  float angle_center;
+  calibrationGet(&x_offset, &y_offset, &z_offset, &angle_center);
+
   for(;;) {
     vTaskDelayUntil(&last_ticks, pdMS_TO_TICKS(5));
 
@@ -90,43 +102,41 @@ static void PIDTask(void *arg) {
     }
 
     // 1. OBTENER THETA (Ángulo en Radianes)
-    // El filtro de Madgwick nos da el ángulo filtrado. Restamos el offset de calibración.
     float current_theta_deg = getAngle() - angle_point;
     theta = current_theta_deg * (PI / 180.0f);
     
     // 2. OBTENER THETA_DOT (Velocidad angular rad/s)
-    // Usamos el giroscopio directamente (eje Y para el balanceo)
+    // El balanceo (roll) se asocia al eje X en la IMU de M5Bala
     float gyroX, gyroY, gyroZ;
     M5.IMU.getGyroData(&gyroX, &gyroY, &gyroZ);
-    theta_dot = gyroY * (PI / 180.0f);
+    
+    // El filtro de la IMU en imu_filter.cpp usa gryo_x_offset (global)
+    // para corregir los valores crudos del ADC.
+    // Aquí usamos M5.IMU.getGyroData() que ya aplica el escalado GYRO_2000DPS_RES.
+    // Recuperamos el offset global para ser consistentes.
+    extern int16_t gryo_x_offset; 
+    float calibrated_gyroX = gyroX + (gryo_x_offset * 0.061035f); 
+    theta_dot = calibrated_gyroX * (PI / 180.0f);
 
     // 3. OBTENER X (Posición en metros)
     bala.UpdateEncoder();
-    // Promedio de ambos encoders para posición central
     int32_t current_encoder = (bala.wheel_left_encoder + bala.wheel_right_encoder) / 2;
-    // Factor 0.001f: asumiendo 1mm por pulso (ajustar si es necesario)
     x = (float)current_encoder * 0.001f; 
 
     // 4. OBTENER X_DOT (Velocidad lineal m/s)
-    // Derivada numérica con filtro paso bajo suave para reducir ruido de cuantización
     float instant_x_dot = (x - (last_encoder * 0.001f)) / dt;
     x_dot = 0.7f * x_dot + 0.3f * instant_x_dot;
     last_encoder = current_encoder;
 
     // --- LÓGICA DE CONTROL ---
-    // Si la inclinación es excesiva (>70°), paramos motores por seguridad
     if(fabs(current_theta_deg) < 70) {
-      
-      // INFERENCIA RL
       int16_t pwm_output = update_nn_motor_speed(x, x_dot, theta, theta_dot);
       
-      // Límites físicos del driver I2C
       if(pwm_output > 1023) pwm_output = 1023;
       if(pwm_output < -1023) pwm_output = -1023;
       
       bala.SetSpeed(pwm_output, pwm_output);
     } else {
-      // Robot caído: apagado de seguridad y reset de posición
       bala.SetSpeed(0, 0);
       x = 0; x_dot = 0;
       bala.SetEncoder(0, 0);
@@ -134,7 +144,25 @@ static void PIDTask(void *arg) {
   }
 }
 
-// Visualización de la gráfica (opcional)
+// Visualización de la gráfica
 static void draw_waveform() {
-  // Se puede implementar para ver el ángulo en tiempo real en la pantalla
+  #define MAX_LEN 120
+  #define X_OFFSET 100
+  #define Y_OFFSET 95
+  #define X_SCALE 3
+  static int16_t val_buf[MAX_LEN] = {0};
+  static int16_t pt = MAX_LEN - 1;
+  val_buf[pt] = constrain((int16_t)(getAngle() * X_SCALE), -50, 50);
+
+  if (--pt < 0) {
+    pt = MAX_LEN - 1;
+  }
+
+  for (int i = 1; i < (MAX_LEN); i++) {
+    uint16_t now_pt = (pt + i) % (MAX_LEN);
+    M5.Lcd.drawLine(i + X_OFFSET, val_buf[(now_pt + 1) % MAX_LEN] + Y_OFFSET, i + 1 + X_OFFSET, val_buf[(now_pt + 2) % MAX_LEN] + Y_OFFSET, TFT_BLACK);
+    if (i < MAX_LEN - 1) {
+      M5.Lcd.drawLine(i + X_OFFSET, val_buf[now_pt] + Y_OFFSET, i + 1 + X_OFFSET, val_buf[(now_pt + 1) % MAX_LEN] + Y_OFFSET, TFT_GREEN);
+    }
+  }
 }

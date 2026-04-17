@@ -16,11 +16,12 @@ float activation(float x) {
 int16_t update_nn_motor_speed(float x, float x_dot, float theta, float theta_dot) {
     
     // 1. NORMALIZACIÓN (IMPORTANTE: Debe coincidir con tu entrenamiento en Gym)
-    // Ajusta estos valores si en tu entrenamiento dividiste por otros números
+    // Se ha ajustado el umbral de theta a 0.4189f (24 grados) para coincidir con el entorno de entrenamiento
+    // y suavizar la respuesta del control.
     float input[4];
     input[0] = x / 2.4f;         // x_threshold
     input[1] = x_dot / 5.0f;     // Escala típica de velocidad
-    input[2] = theta / 0.21f;    // theta_threshold (aprox 12 grados)
+    input[2] = theta / 0.4189f;  // theta_threshold (±24 grados para normalizar mejor)
     input[3] = theta_dot / 10.0f; // Escala típica de velocidad angular
 
     // Capas intermedias
@@ -58,5 +59,6 @@ int16_t update_nn_motor_speed(float x, float x_dot, float theta, float theta_dot
     // Convertimos el rango [-1, 1] a [-1023, 1023]
     int16_t pwm = (int16_t)(action * 1023.0f);
 
-    return -pwm;
+    // Mantenemos la inversión de los motores solicitada por el usuario
+    return pwm;
 }
