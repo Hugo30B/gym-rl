@@ -44,9 +44,38 @@ class Bala2Env(gym.Env):
         self.gravity        = 9.8
         self.masscart_nom   = 0.161    # kg  (chasis + ruedas)
         self.masspole_nom   = 0.124    # kg  (cuerpo superior)
-        self.length_nom     = 0.015    # m   (dist. eje rueda → CoM cuerpo)
+        self.length_nom     = 0.02    # m   (dist. eje rueda → CoM cuerpo)
         self.force_mag      = 5.0     # N   (fuerza máxima aplicable)
         self.tau            = 0.005   # s   (200 Hz — igual que el real)
+
+        # Momento de inercia del cuerpo superior respecto a su propio CoM.
+        # El cartpole clásico asume barra uniforme (4/3) o masa puntual:
+        # AMBOS infraestiman la inercia real del BALA2.
+        #
+        # Dimensiones MEDIDAS del robot:
+        #   h_body = 0.045m  (altura: eje de la rueda → tope del robot)
+        #   w_body = 0.050m  (profundidad: 2.5cm a cada lado del CoM)
+        #
+        # I_body = m*(w²+h²)/12  (placa rectangular, eje perpendicular al plano)
+        #        = 0.124*(0.050²+0.045²)/12 = 4.68e-5 kg·m²
+        #
+        # Consecuencia sin esta corrección:
+        #   I_eff_antiguo = 4/3*m*l² ≈ 3.72e-5 kg·m²   (barra uniforme, INCORRECTO)
+        #   I_eff_real    = I_body + m*l² ≈ 7.47e-5 kg·m²
+        #   → Robot real rota 2.0x MÁS LENTO que en sim.
+        #   → Policy aprende "impulso corto basta" → en robot real el mismo
+        #     impulso es insuficiente → sigue inclinado → aplica más → oscila.
+        #
+        # NOTA sobre l=0.015m: con h_body=4.5cm, un cuerpo uniforme tendría
+        # su CoM a ~2.2cm del eje. l=1.5cm implica que la batería (masa grande)
+        # está muy baja. Si el robot deriva sistemáticamente, verificar l midiendo
+        # el punto de equilibrio estático real y ajustando angle_point en Arduino.
+        #
+        # DR ±20% — tighter que la estimación anterior porque las dimensiones
+        # ya están medidas; el rango cubre variación de cables y posición batería.
+        self.w_body_nom     = 0.050   # m  profundidad total (medida)
+        self.h_body_nom     = 0.045   # m  altura eje rueda → tope (medida)
+        self.I_body_nom     = self.masspole_nom * (self.w_body_nom**2 + self.h_body_nom**2) / 12
 
         # ── Modelo de fricción (Coulomb + viscosa) ─────────────────────────
         # f_total = f_coulomb * sign(ẋ) + f_viscous * ẋ
@@ -55,20 +84,36 @@ class Bala2Env(gym.Env):
         self.friction_viscous_nom = 0.03   # N·s/m (amortiguamiento viscoso)
 
         # ── Modelo de motor ────────────────────────────────────────────────
-        # Zona muerta: comandos |u| < deadzone → 0 N (umbral real ~4-6%)
-        self.motor_deadzone   = 0.05
-        # Lag de 1er orden: simula la inercia eléctrica y mecánica del motor
-        # out[k] = α·out[k-1] + (1-α)·cmd[k]
-        # τ_motor ≈ 25ms (N20 con reductora — τ mucho menor que motores grandes)
-        # α = exp(-dt/τ) = exp(-0.005/0.025) ≈ 0.819  @200Hz
-        # NOTA: con l=0.015m el péndulo cae en ~26 pasos; un lag de 56ms (α=0.915)
-        # haría al motor demasiado lento para reaccionar a tiempo.
-        self.motor_lag_alpha  = 0.819
-        # Ganancia nominal del motor (randomizable ±20%)
+        # Zona muerta NOMINAL: varía con temperatura, batería y fricción del
+        # tren de tracción. Se randomiza en reset() entre 4% y 14%.
+        # Nominal más alto (7%) porque los N20 reales suelen necesitar más
+        # PWM del esperado para vencer la fricción estática.
+        self.motor_deadzone_nom = 0.07
+
+        # Constante de tiempo del motor NOMINAL: τ=20ms es un N20 típico.
+        # Se randomiza en reset() para cubrir τ ∈ [8ms, 35ms]:
+        #   τ=8ms  (α=0.607): batería llena, motor frío → respuesta rápida
+        #   τ=20ms (α=0.779): condición nominal
+        #   τ=35ms (α=0.867): batería baja, motor caliente → respuesta lenta
+        #
+        # Por qué esto resuelve la sobrecorrección en el robot real:
+        #   Si el policy solo entrena con τ=25ms, aprende "manda comandos grandes
+        #   porque el lag los absorbe". En el robot real con τ<25ms, esos mismos
+        #   comandos entregan 1.5–2× más fuerza de lo esperado → sobrecorrección.
+        #   Con DR sobre τ, el policy aprende a ser conservador en los comandos.
+        self.tau_motor_nom    = 0.020   # s  (nominal; DR cubre [0.008, 0.035])
+
+        # Ganancia nominal (randomizable ±20% en reset)
         self.motor_gain_nom   = 1.0
-        # Ruido de torque (std relativo a la fuerza máxima): ±3%
-        # Se aplica DESPUÉS del lag, simulando variación de voltaje/slip.
+        # Ruido de torque ±3% aplicado después del lag
         self.torque_noise_std = 0.03
+
+        # Valores por defecto (sobreescritos en reset por DR)
+        self.motor_deadzone   = self.motor_deadzone_nom
+        self.motor_lag_alpha  = np.exp(-self.tau / self.tau_motor_nom)
+        # I_body y constantes derivadas también se sobreescriben en reset()
+        self.I_body           = self.I_body_nom
+        self.I_eff            = self.I_body_nom + self.masspole_nom * self.length_nom ** 2
 
         # ── Ruido de sensores ──────────────────────────────────────────────
         # IMU (MPU6886 en el M5Stack): datos a 100 Hz, filtrado a 50 Hz.
@@ -101,7 +146,8 @@ class Bala2Env(gym.Env):
         self.action_queue   = deque(maxlen=self.latency_steps + 1)
 
         # ── Límites de episodio ────────────────────────────────────────────
-        self.theta_threshold_radians = 12 * 2 * math.pi / 360   # ±12°
+        #self.theta_threshold_radians = 12 * 2 * math.pi / 360   # ±12°
+        self.theta_threshold_radians = 18 * 2 * math.pi / 360   # ±18°
         self.x_threshold             = 2.4                       # ±2.4 m
         self.max_episode_steps       = 2000  # 2000 pasos × 5ms = 10s de episodio
 
@@ -134,6 +180,12 @@ class Bala2Env(gym.Env):
         self._imu_bias      = 0.0   # Bias acumulado del IMU
         self._angle_offset  = 0.0   # Offset del CoG (angle_point del firmware)
         self._last_x_obs    = 0.0   # Último valor de x observado (para stuck encoder)
+        self._prev_force    = 0.0   # Fuerza del paso anterior (para penalización de suavidad)
+        # Filtro IIR de x_dot: espeja exactamente la línea del Arduino:
+        #   x_dot = 0.7f * x_dot + 0.3f * instant_x_dot
+        # Sin este filtro la red entrena con x_dot instantáneo pero en el
+        # robot recibe x_dot suavizado → cree que va más despacio → sobrecompensa.
+        self._xdot_filtered = 0.0
 
     # ══════════════════════════════════════════════════════════════════════
     # MODELO DE MOTOR
@@ -222,10 +274,12 @@ class Bala2Env(gym.Env):
         · Encoder (x, ẋ):
             - Cuantización discreta (resolución 0.5mm del N20).
             - Ruido gaussiano por jitter de conteo.
-            - Stuck-reading (~1%): devuelve último x conocido y xdot≈0,
-              simulando cuando el driver I2C no ha actualizado el contador.
-            - x normalizado por x_threshold → red ve [-2, 2] en lugar de
-              metros absolutos.
+            - Stuck-reading (~0.2%): devuelve último x conocido y xdot≈0.
+            - Filtro IIR 0.7/0.3 en x_dot — espeja exactamente el Arduino:
+                x_dot = 0.7*x_dot_prev + 0.3*instant_x_dot
+              τ≈12ms. Sin este filtro, la red entrena con x_dot instantáneo
+              pero en el robot recibe x_dot suavizado → error de escala.
+            - x normalizado por x_threshold → red ve [-2, 2].
         """
         x, x_dot, theta, theta_dot = self.state
 
@@ -235,8 +289,6 @@ class Bala2Env(gym.Env):
                                        -self.imu_bias_limit,
                                         self.imu_bias_limit))
 
-        # angle_offset: calibración imperfecta del punto de equilibrio.
-        # La NN ve theta relativo a la "calibración", no al cero real.
         theta_obs    = (theta + self._imu_bias
                         + self.np_random.normal(0.0, self.theta_noise_std)
                         - self._angle_offset)
@@ -244,17 +296,28 @@ class Bala2Env(gym.Env):
 
         # ── Encoder ───────────────────────────────────────────────────────
         if self.np_random.random() < self.encoder_stuck_prob:
-            # Lectura congelada: I2C devuelve el contador sin actualizar.
-            # x_obs = último valor guardado, xdot_obs ≈ 0.
+            # Stuck: el encoder devuelve el mismo valor que el paso anterior.
+            # En Arduino: instant_x_dot = (x - x_prev) / dt ≈ 0
+            #             x_dot = 0.7 * x_dot + 0.3 * 0.0 = 0.7 * x_dot
+            # El gym debe hacer lo mismo — NO retornar 0 directamente,
+            # porque eso diverge del estado del filtro que mantiene el Arduino.
+            self._xdot_filtered = 0.7 * self._xdot_filtered   # espeja Arduino
             x_obs    = self._last_x_obs
-            xdot_obs = self.np_random.normal(0.0, self.xdot_noise_std * 0.2)
+            xdot_obs = float(self._xdot_filtered)
         else:
             x_obs = x + self.np_random.normal(0.0, self.x_noise_std)
             x_obs = np.round(x_obs / self.encoder_resolution) * self.encoder_resolution
             self._last_x_obs = float(x_obs)
-            xdot_obs = x_dot + self.np_random.normal(0.0, self.xdot_noise_std)
+            # x_dot instantáneo (con ruido) — luego se filtra igual que en Arduino
+            instant_xdot = x_dot + self.np_random.normal(0.0, self.xdot_noise_std)
+            # Filtro IIR 0.7/0.3 — debe ser idéntico al Arduino:
+            #   x_dot = 0.7f * x_dot + 0.3f * instant_x_dot
+            self._xdot_filtered = 0.7 * self._xdot_filtered + 0.3 * instant_xdot
+            xdot_obs = self._xdot_filtered
 
-        # Normalizar x por x_threshold: red recibe [-2, 2] en lugar de metros.
+        # Normalizar x: la red recibe x/x_threshold ∈ [-2, 2].
+        # CRÍTICO: el Arduino debe dividir también por x_threshold (2.4)
+        # antes de pasar x a update_nn_motor_speed. Ver comentario en Arduino.
         x_obs_norm = float(x_obs) / self.x_threshold
 
         return np.array([x_obs_norm, xdot_obs, theta_obs, thetadot_obs], dtype=np.float32)
@@ -272,53 +335,69 @@ class Bala2Env(gym.Env):
         force: float,
     ) -> float:
         """
-        Diseño de recompensa para sim-to-real:
+        Diseño de recompensa v4 — corrige la oscilación creciente.
 
-        ┌─────────────────────────────────────────────────────────────────┐
-        │  r_θ  = exp(-k_θ · θ²)          Pico 1.0 en θ=0               │
-        │                                  ≈0.70 a ±5°  (señal rica)     │
-        │                                  ≈0.10 a ±10° (umbral claro)   │
-        │                                                                 │
-        │  r_x  = exp(-k_x · x²)          Penaliza drift suave           │
-        │                                  ≈0.78 a ±0.8m                 │
-        │                                                                 │
-        │  r_vel = -α_ẋ·ẋ² - α_θ̇·θ̇²      Amortiguamiento de velocidades │
-        │                                  Favorece control suave         │
-        │                                                                 │
-        │  r_act = -α_u·(F/Fmax)²          Coste cuadrático de acción     │
-        │                                  Evita saturar el motor         │
-        │                                                                 │
-        │  TOTAL = r_θ · r_x + r_vel + r_act                             │
-        │                                                                 │
-        │  Rango aprox: [-0.15, +1.0] por paso cuando el robot balancea. │
-        │  Sin cap explotable: el agente DEBE mantener θ≈0 y x≈0.        │
-        └─────────────────────────────────────────────────────────────────┘
+        DIAGNÓSTICO DEL PROBLEMA ANTERIOR:
+          r_θ=exp(-15θ²) trataba θ=0 con θ̇=2 rad/s casi igual que θ=3° con
+          θ̇=0 (rewards 0.968 vs 0.950). La ganancia de corregir 5°→0° valía
+          0.108, pero la penalización por θ̇=1 rad/s solo 0.008 → ratio 13:1.
+          El agente aprendía: "corrige agresivo, el momento acumulado es barato".
 
-        Por qué no hay cap:
-          · r_θ · r_x nunca supera 1.0 por construcción matemática.
-          · r_vel y r_act son negativos → no se puede "inflar" la recompensa
-            quedándose quieto ni saturando el motor.
-          · No hay término lineal constante que el agente pueda acumular
-            sin hacer nada útil.
+        SOLUCIÓN — Gaussiana conjunta en espacio de fase (θ, θ̇):
+
+          r_upright = exp(-k_θ·θ² - k_ω·θ̇²)
+
+            θ=0°, θ̇=0   → r = 1.000  (equilibrio perfecto)
+            θ=0°, θ̇=2   → r = 0.619  (cruce con momentum → penalizado)
+            θ=3°, θ̇=0   → r = 0.960  (inclinado pero frenando → OK)
+            θ=5°, θ̇=3   → r = 0.429  (cayendo rápido → muy malo)
+
+          Ahora θ=0 CON velocidad angular alta es penalizado. El agente
+          aprende que el objetivo no es "cruzar el cero rápido" sino
+          "detenerse cerca del cero".
+
+          r_x     = exp(-k_x·x²)      Penalización de posición
+          r_xdot  = -α_ẋ·ẋ²          Penalización de velocidad lineal
+          r_act   = -α_a·(F/Fmax)²   Penalización de magnitud de fuerza
+                     Incentiva correcciones pequeñas cuando son suficientes.
+                     Sin este término, el policy no tiene razón para usar
+                     comandos suaves cerca del equilibrio.
+          r_smooth= -α_s·(ΔF/Fmax)²  Anti-bang-bang: penaliza flip brusco
+
+          TOTAL = r_upright · r_x + r_xdot + r_act + r_smooth
         """
-        # Componente de ángulo — término principal
+        # ── Gaussiana conjunta en espacio de fase (θ, θ̇) ─────────────────
+        # k_omega=0.12: θ̇=0.5 rad/s → factor 0.970 (corrección suave, OK)
+        #               θ̇=2.0 rad/s → factor 0.619 (cruce rápido, penalizado)
+        #               θ̇=3.0 rad/s → factor 0.407 (oscilación fuerte, muy malo)
         k_theta = 15.0
-        r_theta = float(np.exp(-k_theta * theta ** 2))
+        k_omega = 0.12
+        r_upright = float(np.exp(-k_theta * theta ** 2 - k_omega * theta_dot ** 2))
 
-        # Componente de posición — penalización suave al alejarse del centro
-        k_x = 0.30
+        # ── Posición ──────────────────────────────────────────────────────
+        k_x = 0.10
         r_x = float(np.exp(-k_x * x ** 2))
 
-        # Penalización de velocidades — fomenta estabilidad y suavidad
-        alpha_xdot    = 0.015
-        alpha_thetadot = 0.008
-        r_vel = -alpha_xdot * x_dot ** 2 - alpha_thetadot * theta_dot ** 2
+        # ── Velocidad lineal ──────────────────────────────────────────────
+        alpha_xdot = 0.02
+        r_xdot = -alpha_xdot * x_dot ** 2
 
-        # Coste cuadrático de acción — penaliza uso ineficiente del motor
-        alpha_action = 0.04
-        r_act = -alpha_action * (force / self.force_mag) ** 2
+        # ── Magnitud absoluta de fuerza ───────────────────────────────────
+        # Incentiva usar la mínima fuerza necesaria.
+        # α_act=0.015: saturación completa penaliza -0.015/paso — señal
+        # pequeña pero acumulada sobre 2000 pasos el policy prefiere
+        # comandos más suaves cuando el ángulo ya está controlado.
+        # Esto es lo que permite "correcciones finas" en el robot real.
+        alpha_act = 0.015
+        r_act = -alpha_act * (force / self.force_mag) ** 2
 
-        return r_theta * r_x + r_vel + r_act
+        # ── Suavidad del motor — anti-bang-bang ───────────────────────────
+        alpha_smooth = 0.03
+        delta_force_norm = (force - self._prev_force) / self.force_mag
+        r_smooth = -alpha_smooth * delta_force_norm ** 2
+
+        return r_upright * r_x + r_xdot + r_act + r_smooth
+
 
     # ══════════════════════════════════════════════════════════════════════
     # STEP
@@ -343,14 +422,25 @@ class Bala2Env(gym.Env):
         # ── 2. Modelo de motor ─────────────────────────────────────────────
         force = self._apply_motor_model(raw)
 
-        # ── 3. Dinámica del péndulo invertido ──────────────────────────────
+        # ── 3. Dinámica del péndulo invertido con inercia de cuerpo rígido ──
         costheta = np.cos(theta)
         sintheta = np.sin(theta)
 
         temp = (force + self.polemass_length * theta_dot ** 2 * sintheta) / self.total_mass
-        thetaacc = (self.gravity * sintheta - costheta * temp) / (
-            self.length * (4.0 / 3.0 - self.masspole * costheta ** 2 / self.total_mass)
-        )
+
+        # Fórmula generalizada con I_eff = I_body + m_pole * l²
+        # (Lagrangiano completo del péndulo invertido sobre carro con cuerpo rígido)
+        #
+        # Denominador = I_eff / (m_pole * l) - m_pole * l * cos²θ / M_total
+        #
+        # Para barra uniforme: I_eff = 4/3 * m * l²  →  I_eff/(m*l) = 4/3 * l
+        # Para BALA2 (caja):   I_eff = I_body + m*l² →  I_eff/(m*l) = I_body/(m*l) + l
+        #
+        # El robot real tiene I_eff ~1.9x mayor que barra uniforme →
+        # el denominador es mayor → θ̈ es menor → el robot rota más lento.
+        denom = self.I_eff / (self.masspole * self.length) \
+                - self.polemass_length * costheta ** 2 / self.total_mass
+        thetaacc = (self.gravity * sintheta - costheta * temp) / denom
         xacc_ideal = temp - self.polemass_length * thetaacc * costheta / self.total_mass
 
         # ── 4. Fricción Coulomb + viscosa ──────────────────────────────────
@@ -380,6 +470,7 @@ class Bala2Env(gym.Env):
             # así que -2.0 es suficiente señal negativa sin dominar el gradiente
             # en episodios cortos de early training (12-30 pasos × ~0.5 reward ≈ 6-15).
             reward = -2.0
+        self._prev_force = force  # Guardar para penalización de suavidad del siguiente paso
 
         # ── 8. Observación con ruido ───────────────────────────────────────
         obs = self._get_observation()
@@ -399,6 +490,8 @@ class Bala2Env(gym.Env):
         self._motor_output  = 0.0
         self._imu_bias      = 0.0
         self._last_x_obs    = 0.0
+        self._prev_force    = 0.0
+        self._xdot_filtered = 0.0
 
         # ── Domain Randomization ───────────────────────────────────────────
         # Cada episodio: el robot real tiene variaciones por temperatura,
@@ -414,12 +507,38 @@ class Bala2Env(gym.Env):
         self.friction_coulomb = self.friction_coulomb_nom * rng.uniform(0.75, 1.25)
         self.friction_viscous = self.friction_viscous_nom * rng.uniform(0.75, 1.25)
 
-        # Ganancia del motor (±20%) — variación de batería, temperatura, rozamiento
-        self.motor_gain = self.motor_gain_nom * rng.uniform(0.80, 1.20)
+        # Ganancia del motor — DR ∈ [0.70, 1.60]
+        # Asimétrico hacia arriba intencionalmente:
+        #   · Si el robot real produce más fuerza que la simulada (caso probable),
+        #     entrenar con gains hasta 1.60 fuerza al policy a aprender comandos
+        #     conservadores que sigan funcionando con motores más fuertes.
+        #   · Con DR=[0.8,1.2], el policy nunca ve "motor muy fuerte" → no aprende
+        #     a ser conservador → en robot real sobrecompensa.
+        self.motor_gain = self.motor_gain_nom * rng.uniform(0.70, 1.60)
 
-        # Constantes derivadas
+        # Constante de tiempo del motor — DR sobre τ ∈ [8ms, 35ms]
+        tau_motor = rng.uniform(0.008, 0.035)
+        self.motor_lag_alpha = float(np.exp(-self.tau / tau_motor))
+
+        # Zona muerta del motor — DR ∈ [4%, 8%]
+        # REDUCIDO desde [4%, 14%] — rango demasiado amplio causaba overcorrección:
+        #   Con max_deadzone=14%, el policy aprende a mandar cmd>14% siempre.
+        #   En robot con deadzone_real=6%, cmd=0.15 producía 8x más fuerza efectiva
+        #   de la esperada (0.48N vs 0.06N). A [4%,8%], el ratio baja a ~2x.
+        #   El rango [4%,8%] cubre la variación real de un N20 (carga, temperatura).
+        self.motor_deadzone = float(rng.uniform(0.04, 0.08))
+
+        # Constantes derivadas (incluyendo inercia efectiva con cuerpo rígido)
         self.total_mass      = self.masscart + self.masspole
         self.polemass_length = self.masspole * self.length
+        # I_body: momento de inercia del cuerpo respecto a su CoM (±20%)
+        # Tighter que la estimación anterior (era ±30%) porque las dimensiones
+        # ya están medidas. El rango cubre: cables, posición de la batería,
+        # y tolerancias de fabricación del chasis.
+        self.I_body = self.I_body_nom * rng.uniform(0.80, 1.20)
+        # I_eff: momento de inercia total respecto al eje de las ruedas
+        # (teorema de Steiner / eje paralelo)
+        self.I_eff  = self.I_body + self.masspole * self.length ** 2
 
         # Limpiar cola de latencia
         self.action_queue.clear()
@@ -439,16 +558,19 @@ class Bala2Env(gym.Env):
             self.state = rng.uniform(low=low, high=high, size=(4,))
         else:
             self.state = np.array([
-                rng.uniform(-0.05,  0.05),    # x        [m]   — posición
-                rng.uniform(-0.05,  0.05),    # x_dot    [m/s] — velocidad lineal
-                rng.uniform(-0.015, 0.015),   # theta    [rad] — ángulo (~0.86°)
-                rng.uniform(-0.05,  0.05),    # theta_dot[rad/s]
+                rng.uniform(-0.05,  0.05),    
+                rng.uniform(-0.05,  0.05),    
+                # AUMENTADO: de ±0.86° a ±7.5° aprox.
+                rng.uniform(-0.13,  0.13),   
+                # AUMENTADO: dale también un empujón inicial más fuerte
+                rng.uniform(-0.15,  0.15),    
             ])
 
         # Offset del punto de equilibrio (angle_point del firmware).
         # Reducido a ±0.5° — suficiente para cubrir la imprecisión de calibración
         # real sin añadir dificultad innecesaria en las primeras etapas de entrenamiento.
-        self._angle_offset = rng.uniform(-0.5, 0.5) * math.pi / 180  # rad
+        #self._angle_offset = rng.uniform(-0.5, 0.5) * math.pi / 180  # rad
+        self._angle_offset = rng.uniform(-2.5, 2.5) * math.pi / 180  # rad
 
         self.steps_beyond_terminated = None
 
