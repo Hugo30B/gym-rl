@@ -12,6 +12,10 @@ powershell -ExecutionPolicy ByPass -c "irm https://astral.sh/uv/install.ps1 | ie
 
 # Mac / Linux
 curl -LsSf https://astral.sh/uv/install.sh | sh
+
+brew install uv # MacOS con Homebrew
+
+sudo pacman -S uv # Arch Linux
 ```
 
 Cierra y vuelve a abrir la terminal tras la instalacion.

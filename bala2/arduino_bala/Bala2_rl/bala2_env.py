@@ -44,38 +44,36 @@ class Bala2Env(gym.Env):
         self.gravity        = 9.8
         self.masscart_nom   = 0.161    # kg  (chasis + ruedas)
         self.masspole_nom   = 0.124    # kg  (cuerpo superior)
-        self.length_nom     = 0.02    # m   (dist. eje rueda → CoM cuerpo)
+        self.length_nom     = 0.015    # m   (dist. eje rueda → CoM cuerpo)
         self.force_mag      = 5.0     # N   (fuerza máxima aplicable)
         self.tau            = 0.005   # s   (200 Hz — igual que el real)
 
         # Momento de inercia del cuerpo superior respecto a su propio CoM.
-        # El cartpole clásico asume barra uniforme (4/3) o masa puntual:
-        # AMBOS infraestiman la inercia real del BALA2.
         #
-        # Dimensiones MEDIDAS del robot:
-        #   h_body = 0.045m  (altura: eje de la rueda → tope del robot)
-        #   w_body = 0.050m  (profundidad: 2.5cm a cada lado del CoM)
+        # HISTORIA DE CORRECCIONES:
+        #   v1: barra uniforme (4/3) → I_eff=3.72e-5, ω_n=22.1 rad/s
+        #   v2: h_body=4.5cm (toda la altura del robot) → I_eff=7.47e-5, ω_n=15.6 → MUY LENTO
+        #   v3: h_body=3.0cm (corrección geométrica)   → I_eff=6.30e-5, ω_n=17.0 → LENTO
+        #       Problema: nominal=17 rad/s, robot real≈22 rad/s → robot real en P98 del DR.
+        #       El policy aprendía para robot lento → en robot real sobrecompensa.
         #
-        # I_body = m*(w²+h²)/12  (placa rectangular, eje perpendicular al plano)
-        #        = 0.124*(0.050²+0.045²)/12 = 4.68e-5 kg·m²
+        # CALIBRACIÓN CORRECTA:
+        #   El robot real tiene ω_n≈22 rad/s (comportamiento observado = modelo 4/3).
+        #   Para que el NOMINAL del sim coincida con el robot real:
+        #     I_eff_nom = m_p*g*l / ω_n² = 0.124*9.8*0.015 / 22.1² ≈ 3.76e-5 kg·m²
+        #     I_body_nom = I_eff_nom - m_p*l² = 3.76e-5 - 2.79e-5 ≈ 1.0e-5 kg·m²
         #
-        # Consecuencia sin esta corrección:
-        #   I_eff_antiguo = 4/3*m*l² ≈ 3.72e-5 kg·m²   (barra uniforme, INCORRECTO)
-        #   I_eff_real    = I_body + m*l² ≈ 7.47e-5 kg·m²
-        #   → Robot real rota 2.0x MÁS LENTO que en sim.
-        #   → Policy aprende "impulso corto basta" → en robot real el mismo
-        #     impulso es insuficiente → sigue inclinado → aplica más → oscila.
+        #   Nota geométrica: I_body_nom=1.0e-5 < m*w²/12=2.58e-5 (imposible si w=5cm).
+        #   Esto indica que l=0.015m está sobreestimado, o que la masa del polo no es
+        #   una caja uniforme sino que está concentrada cerca del eje (batería abajo).
+        #   Independientemente del motivo físico, fijar I_body_nom=1.0e-5 hace que el
+        #   NOMINAL de la simulación reproduzca exactamente el comportamiento observado.
         #
-        # NOTA sobre l=0.015m: con h_body=4.5cm, un cuerpo uniforme tendría
-        # su CoM a ~2.2cm del eje. l=1.5cm implica que la batería (masa grande)
-        # está muy baja. Si el robot deriva sistemáticamente, verificar l midiendo
-        # el punto de equilibrio estático real y ajustando angle_point en Arduino.
-        #
-        # DR ±20% — tighter que la estimación anterior porque las dimensiones
-        # ya están medidas; el rango cubre variación de cables y posición batería.
-        self.w_body_nom     = 0.050   # m  profundidad total (medida)
-        self.h_body_nom     = 0.045   # m  altura eje rueda → tope (medida)
-        self.I_body_nom     = self.masspole_nom * (self.w_body_nom**2 + self.h_body_nom**2) / 12
+        # DR [0.40, 2.50]:
+        #   ×0.40 → I_eff=3.19e-5 → ω_n=24.3 rad/s  (robot más ágil)
+        #   ×1.00 → I_eff=3.79e-5 → ω_n=22.3 rad/s  ← NOMINAL = robot real
+        #   ×2.50 → I_eff=5.29e-5 → ω_n=18.9 rad/s  (robot más inerte, batería cargada)
+        self.I_body_nom     = 1.0e-5   # kg·m²  calibrado para ω_n_nom ≈ 22 rad/s
 
         # ── Modelo de fricción (Coulomb + viscosa) ─────────────────────────
         # f_total = f_coulomb * sign(ẋ) + f_viscous * ẋ
@@ -507,37 +505,33 @@ class Bala2Env(gym.Env):
         self.friction_coulomb = self.friction_coulomb_nom * rng.uniform(0.75, 1.25)
         self.friction_viscous = self.friction_viscous_nom * rng.uniform(0.75, 1.25)
 
-        # Ganancia del motor — DR ∈ [0.70, 1.60]
-        # Asimétrico hacia arriba intencionalmente:
-        #   · Si el robot real produce más fuerza que la simulada (caso probable),
-        #     entrenar con gains hasta 1.60 fuerza al policy a aprender comandos
-        #     conservadores que sigan funcionando con motores más fuertes.
-        #   · Con DR=[0.8,1.2], el policy nunca ve "motor muy fuerte" → no aprende
-        #     a ser conservador → en robot real sobrecompensa.
-        self.motor_gain = self.motor_gain_nom * rng.uniform(0.70, 1.60)
+        # Ganancia del motor — DR ∈ [0.85, 1.15]
+        # Acotado desde [0.80, 1.30]: el ratio 1.625× anterior generaba demasiada
+        # varianza en la curva. [0.85,1.15] cubre variación real de batería (ratio 1.35×)
+        # sin hacer el problema de aprendizaje intratablemente variable.
+        self.motor_gain = self.motor_gain_nom * rng.uniform(0.85, 1.15)
 
         # Constante de tiempo del motor — DR sobre τ ∈ [8ms, 35ms]
         tau_motor = rng.uniform(0.008, 0.035)
         self.motor_lag_alpha = float(np.exp(-self.tau / tau_motor))
 
         # Zona muerta del motor — DR ∈ [4%, 8%]
-        # REDUCIDO desde [4%, 14%] — rango demasiado amplio causaba overcorrección:
-        #   Con max_deadzone=14%, el policy aprende a mandar cmd>14% siempre.
-        #   En robot con deadzone_real=6%, cmd=0.15 producía 8x más fuerza efectiva
-        #   de la esperada (0.48N vs 0.06N). A [4%,8%], el ratio baja a ~2x.
-        #   El rango [4%,8%] cubre la variación real de un N20 (carga, temperatura).
         self.motor_deadzone = float(rng.uniform(0.04, 0.08))
 
-        # Constantes derivadas (incluyendo inercia efectiva con cuerpo rígido)
+        # Constantes derivadas
         self.total_mass      = self.masscart + self.masspole
         self.polemass_length = self.masspole * self.length
-        # I_body: momento de inercia del cuerpo respecto a su CoM (±20%)
-        # Tighter que la estimación anterior (era ±30%) porque las dimensiones
-        # ya están medidas. El rango cubre: cables, posición de la batería,
-        # y tolerancias de fabricación del chasis.
-        self.I_body = self.I_body_nom * rng.uniform(0.80, 1.20)
-        # I_eff: momento de inercia total respecto al eje de las ruedas
-        # (teorema de Steiner / eje paralelo)
+
+        # I_body DR [0.40, 2.50] centrado en el robot real.
+        # Con I_body_nom=1.0e-5: ×1.00 → ω_n=22.3 rad/s (nominal = robot real).
+        # Antes: I_body_nom=3.51e-5 y DR [0.25,1.30] → robot real en P98 del DR,
+        # 95% de episodios más lentos que el robot real → policy aprendía dinámica lenta.
+        # Ahora: nominal coincide con robot real → la mayoría de episodios reproducen
+        # el comportamiento observado → convergencia más rápida y robusta.
+        #   ×0.40 → ω_n=24.3  (robot ágil)
+        #   ×1.00 → ω_n=22.3  (nominal = robot real)
+        #   ×2.50 → ω_n=18.9  (robot con más inercia, ej. carga extra)
+        self.I_body = self.I_body_nom * rng.uniform(0.40, 2.50)
         self.I_eff  = self.I_body + self.masspole * self.length ** 2
 
         # Limpiar cola de latencia
