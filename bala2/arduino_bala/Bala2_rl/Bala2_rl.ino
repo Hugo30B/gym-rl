@@ -12,15 +12,10 @@
 extern int16_t update_nn_motor_speed(float x, float x_dot, float theta, float theta_dot);
 // -------------------------------------
 
-// Umbral de normalización de x — DEBE coincidir con x_threshold del gym (2.4m).
+
 static const float X_THRESHOLD = 2.4f;
 
-// Escala de salida del motor — válvula de ajuste sin reentrenar.
-// Si el robot sobrecompensa, bajar este valor (probar 0.55, 0.50...).
-// Si subcompensa y no puede balancear, subirlo (0.70, 0.75...).
-// Valor inicial: 0.65 (asume fuerza real ≈ 1.5x fuerza simulada).
-// Razonamiento: force_mag=5N en sim, motores N20 reales pueden dar 7-10N.
-static const float MOTOR_SCALE = 0.45f;
+static const float MOTOR_SCALE = 0.95f;
 
 extern uint8_t bala_img[41056];
 static void PIDTask(void *arg);
@@ -97,16 +92,11 @@ static void PIDTask(void *arg) {
       continue;
     }
 
-    // ── 1. THETA (ángulo en radianes) ──────────────────────────────────
+// ── 1. THETA (ángulo en radianes) ──────────────────────────────────
     float current_theta_deg = getAngle() - angle_point;
     theta = current_theta_deg * (PI / 180.0f);
     
     // ── 2. THETA_DOT (velocidad angular rad/s) ─────────────────────────
-    // M5.IMU.getGyroData() devuelve valores YA escalados y con el offset
-    // interno del MPU6886 aplicado por el driver. NO hay que re-aplicar
-    // el offset manualmente: hacerlo introduce un bias fijo permanente.
-    // BUG ANTERIOR: calibrated_gyroX = gyroX + (gryo_x_offset * 0.061035f)
-    //               duplicaba el offset que el driver ya aplicó.
     float gyroX, gyroY, gyroZ;
     M5.IMU.getGyroData(&gyroX, &gyroY, &gyroZ);
     theta_dot = gyroX * (PI / 180.0f);
@@ -117,28 +107,20 @@ static void PIDTask(void *arg) {
     x = (float)current_encoder * 0.001f;
 
     // ── 4. X_DOT (velocidad lineal m/s, filtrada con IIR 0.7/0.3) ─────
-    // El filtro debe ser IDÉNTICO al del gym (_xdot_filtered en _get_observation).
-    // Gym:     self._xdot_filtered = 0.7 * self._xdot_filtered + 0.3 * instant_xdot
-    // Arduino: x_dot = 0.7f * x_dot + 0.3f * instant_x_dot   ← igual
     float instant_x_dot = (x - (last_encoder * 0.001f)) / dt;
     x_dot = 0.7f * x_dot + 0.3f * instant_x_dot;
     last_encoder = current_encoder;
 
-    // ── 5. NORMALIZACIÓN ANTES DE PASAR A LA RED ──────────────────────
-    // CORRECCIÓN CRÍTICA: el gym entrena con x/X_THRESHOLD como primera
-    // observación (ver _get_observation: x_obs_norm = x_obs / self.x_threshold).
-    // Sin normalizar, a x=0.3m la red recibe 0.3 en lugar de 0.125 →
-    // interpreta la posición como 2.4× más lejos → sobrecompensa gravemente.
-    float x_norm = x / X_THRESHOLD;
 
     // ── 6. INFERENCIA Y ACTUACIÓN ─────────────────────────────────────
     if(fabs(current_theta_deg) < 70) {
-      int16_t pwm_output = update_nn_motor_speed(x_norm, x_dot, theta, theta_dot);
+      // PASAMOS LAS VARIABLES CRUDAS (La función internamente las divide)
+      int16_t pwm_output = update_nn_motor_speed(x, x_dot, theta, theta_dot);
       
-      // Aplicar escala de fuerza — ajustar MOTOR_SCALE si sobrecompensa.
-      // No aplicar antes de pasar a la red; la red sigue viendo observaciones reales.
+      // Aplicar escala de fuerza
       pwm_output = (int16_t)(pwm_output * MOTOR_SCALE);
       
+      // Saturación de seguridad
       if(pwm_output > 1023) pwm_output = 1023;
       if(pwm_output < -1023) pwm_output = -1023;
       
