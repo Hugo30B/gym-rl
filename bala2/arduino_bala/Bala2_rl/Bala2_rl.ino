@@ -8,14 +8,14 @@
 #include "pid.h"
 #include "calibration.h"
 
-// --- INTERFAZ CON TU RED NEURONAL (implementada en mi_modelo.cpp) ---
+// --- INTERFAZ CON LA RED NEURONAL (implementada en mi_modelo.cpp) ---
 extern int16_t update_nn_motor_speed(float x, float x_dot, float theta, float theta_dot);
 // -------------------------------------
 
 
 static const float X_THRESHOLD = 2.4f;
 
-static const float MOTOR_SCALE = 0.95f;
+static const float MOTOR_SCALE = 0.7f;
 
 extern uint8_t bala_img[41056];
 static void PIDTask(void *arg);
@@ -92,7 +92,7 @@ static void PIDTask(void *arg) {
       continue;
     }
 
-// ── 1. THETA (ángulo en radianes) ──────────────────────────────────
+    // ── 1. THETA (ángulo en radianes) ──────────────────────────────────
     float current_theta_deg = getAngle() - angle_point;
     theta = current_theta_deg * (PI / 180.0f);
     

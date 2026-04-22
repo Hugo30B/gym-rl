@@ -7,8 +7,6 @@ from gymnasium.error import DependencyNotInstalled
 class Bala2Env(gym.Env):
     """
     Digital twin of the M5Stack Bala2Fire — Simplified & Effective Sim-to-Real.
-    Corregido con dinámica de cuerpo rígido (Caja), momentos de inercia reales,
-    y penalización de suavidad (anti-bang-bang) para evitar temblores físicos.
     """
     metadata = {
         "render_modes": ["human", "rgb_array"],
@@ -34,7 +32,7 @@ class Bala2Env(gym.Env):
         self.max_episode_steps = 2000
 
         # ── Motor y Ruido Nominal ──────────────────────────────────────────
-        self.motor_deadzone = 0.05
+        self.motor_deadzone = 0.01
         self.motor_lag_alpha = 0.8  # 0.0 = sin lag, 1.0 = congelado
 
         # ── Espacios ───────────────────────────────────────────────────────
@@ -108,14 +106,14 @@ class Bala2Env(gym.Env):
         )
         truncated = self.elapsed_steps >= self.max_episode_steps
 
-        # 5. Recompensa Anti-Temblores (LQR-style + Smoothness Penalty)
+        # 5. Recompensa
         if not terminated:
             reward = 1.0 \
                      - 2.0 * (theta / self.theta_threshold_radians)**2 \
                      - 0.1 * (x / self.x_threshold)**2 \
                      - 0.1 * (theta_dot)**2 \
                      - 0.1 * (raw_cmd)**2 \
-                     #- 0.8 * (delta_action)**2  # Castigo severo a los tirones bruscos
+                     - 0.2 * (delta_action)**2  # Castigo severo a los tirones bruscos
         else:
             reward = -10.0
 
